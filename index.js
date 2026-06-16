@@ -1,14 +1,15 @@
 const Parser = require('rss-parser');
 const crypto = require('crypto');
 
-const parser = new Parser({ timeout: 15000 });
+const parser = new Parser({ timeout: 20000 });
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const CHECK_INTERVAL_MINUTES = Number(process.env.CHECK_INTERVAL_MINUTES || 10);
+const CHECK_INTERVAL_MINUTES = Number(process.env.CHECK_INTERVAL_MINUTES || 15);
 const IGNORE_EXISTING_ON_START = (process.env.IGNORE_EXISTING_ON_START || 'true').toLowerCase() === 'true';
+const REDDIT_USER_AGENT = process.env.REDDIT_USER_AGENT || 'reddit-dtv-monitor/1.0 by henryliiber';
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variable.');
@@ -45,9 +46,14 @@ const seen = new Set();
 const leads = new Map();
 let firstRun = true;
 let telegramOffset = 0;
+let checkingFeeds = false;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function idFor(text) {
-  return crypto.createHash('sha1').update(text).digest('hex').slice(0, 16);
+  return crypto.createHash('sha1').update(String(text)).digest('hex').slice(0, 16);
 }
 
 function stripHtml(html = '') {
@@ -86,6 +92,26 @@ async function telegram(method, payload) {
     throw new Error(`Telegram ${method} failed: ${JSON.stringify(data)}`);
   }
   return data.result;
+}
+
+async function fetchFeed(feedUrl) {
+  const res = await fetch(feedUrl, {
+    headers: {
+      'user-agent': REDDIT_USER_AGENT,
+      'accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
+    }
+  });
+
+  if (res.status === 429) {
+    throw new Error('Reddit rate limit 429. Waiting for next cycle.');
+  }
+
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  const xml = await res.text();
+  return parser.parseString(xml);
 }
 
 function fallbackReply(item) {
@@ -149,87 +175,104 @@ async function notifyLead(item, feedUrl) {
 }
 
 async function checkFeeds() {
-  console.log(`[${new Date().toISOString()}] Checking ${feeds.length} feeds...`);
+  if (checkingFeeds) return;
+  checkingFeeds = true;
 
-  for (const feedUrl of feeds) {
-    try {
-      const feed = await parser.parseURL(feedUrl);
-      const items = (feed.items || []).slice(0, 10).reverse();
+  try {
+    console.log(`[${new Date().toISOString()}] Checking ${feeds.length} feeds...`);
 
-      for (const item of items) {
-        const unique = item.guid || item.link || item.title;
-        if (!unique) continue;
-        const key = idFor(unique);
-        if (seen.has(key)) continue;
-        seen.add(key);
+    for (const feedUrl of feeds) {
+      try {
+        const feed = await fetchFeed(feedUrl);
+        const items = (feed.items || []).slice(0, 10).reverse();
 
-        if (firstRun && IGNORE_EXISTING_ON_START) continue;
-        if (!isRelevant(item)) continue;
+        for (const item of items) {
+          const unique = item.guid || item.link || item.title;
+          if (!unique) continue;
+          const key = idFor(unique);
+          if (seen.has(key)) continue;
+          seen.add(key);
 
-        await notifyLead(item, feedUrl);
-        await new Promise(r => setTimeout(r, 1500));
+          if (firstRun && IGNORE_EXISTING_ON_START) continue;
+          if (!isRelevant(item)) continue;
+
+          await notifyLead(item, feedUrl);
+          await sleep(2500);
+        }
+      } catch (err) {
+        console.error(`Feed error ${feedUrl}:`, err.message);
       }
-    } catch (err) {
-      console.error(`Feed error ${feedUrl}:`, err.message);
-    }
-  }
 
-  firstRun = false;
+      await sleep(7000);
+    }
+
+    firstRun = false;
+  } finally {
+    checkingFeeds = false;
+  }
 }
 
-async function pollTelegram() {
-  try {
-    const updates = await telegram('getUpdates', {
-      offset: telegramOffset,
-      timeout: 10,
-      allowed_updates: ['callback_query']
-    });
+async function pollTelegramLoop() {
+  // Long-polling loop. Do not use setInterval here, otherwise overlapping getUpdates calls cause Telegram 409 conflict.
+  while (true) {
+    try {
+      const updates = await telegram('getUpdates', {
+        offset: telegramOffset,
+        timeout: 25,
+        allowed_updates: ['callback_query']
+      });
 
-    for (const update of updates) {
-      telegramOffset = update.update_id + 1;
-      const cb = update.callback_query;
-      if (!cb?.data) continue;
+      for (const update of updates) {
+        telegramOffset = update.update_id + 1;
+        const cb = update.callback_query;
+        if (!cb?.data) continue;
 
-      const [action, leadId] = cb.data.split(':');
-      const lead = leads.get(leadId);
+        const [action, leadId] = cb.data.split(':');
+        const lead = leads.get(leadId);
 
-      if (!lead) {
-        await telegram('answerCallbackQuery', {
-          callback_query_id: cb.id,
-          text: 'Lead info expired. Open the Reddit link from the message.',
-          show_alert: true
-        });
-        continue;
+        if (!lead) {
+          await telegram('answerCallbackQuery', {
+            callback_query_id: cb.id,
+            text: 'Lead info expired. Open the Reddit link from the message.',
+            show_alert: true
+          });
+          continue;
+        }
+
+        if (action === 'approve') {
+          await telegram('answerCallbackQuery', {
+            callback_query_id: cb.id,
+            text: 'Approved. Copy the reply text and post manually on Reddit.',
+            show_alert: false
+          });
+          await telegram('sendMessage', {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: `<b>APPROVED reply text</b>\n\n${escapeHtml(lead.reply)}\n\n<b>Reddit link:</b> ${escapeHtml(lead.item.link || '')}`,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          });
+        }
+
+        if (action === 'skip') {
+          await telegram('answerCallbackQuery', {
+            callback_query_id: cb.id,
+            text: 'Skipped.',
+            show_alert: false
+          });
+        }
       }
-
-      if (action === 'approve') {
-        await telegram('answerCallbackQuery', {
-          callback_query_id: cb.id,
-          text: 'Approved. Copy the reply text and post manually on Reddit.',
-          show_alert: false
-        });
-        await telegram('sendMessage', {
-          chat_id: TELEGRAM_CHAT_ID,
-          text: `<b>APPROVED reply text</b>\n\n${escapeHtml(lead.reply)}\n\n<b>Reddit link:</b> ${escapeHtml(lead.item.link || '')}`,
-          parse_mode: 'HTML',
-          disable_web_page_preview: true
-        });
-      }
-
-      if (action === 'skip') {
-        await telegram('answerCallbackQuery', {
-          callback_query_id: cb.id,
-          text: 'Skipped.',
-          show_alert: false
-        });
-      }
+    } catch (err) {
+      console.error('Telegram polling error:', err.message);
+      await sleep(10000);
     }
-  } catch (err) {
-    console.error('Telegram polling error:', err.message);
   }
 }
 
 async function main() {
+  await telegram('deleteWebhook', { drop_pending_updates: false }).catch(err => {
+    console.error('deleteWebhook warning:', err.message);
+  });
+
   await telegram('sendMessage', {
     chat_id: TELEGRAM_CHAT_ID,
     text: '✅ Reddit DTV monitor started. Kontrollin uusi Redditi postitusi automaatselt.'
@@ -237,7 +280,7 @@ async function main() {
 
   await checkFeeds();
   setInterval(checkFeeds, CHECK_INTERVAL_MINUTES * 60 * 1000);
-  setInterval(pollTelegram, 3000);
+  pollTelegramLoop();
 }
 
 main().catch(err => {
