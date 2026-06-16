@@ -18,11 +18,12 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
 
 // Search RSS endpoints get rate-limited easily from cloud IPs. New-post subreddit RSS feeds are more stable.
 // We read newest posts from relevant subreddits and filter locally by DTV/visa keywords.
+// r/digitalnomad is intentionally removed from the default list because it rate-limits cloud IPs very aggressively.
 const feeds = (process.env.REDDIT_FEEDS || `
 https://www.reddit.com/r/ThailandTourism/new.rss
-https://www.reddit.com/r/digitalnomad/new.rss
 https://www.reddit.com/r/Thailand/new.rss
 https://www.reddit.com/r/ThailandExpats/new.rss
+https://www.reddit.com/r/ThailandVisa/new.rss
 https://www.reddit.com/r/expats/new.rss
 https://www.reddit.com/r/visas/new.rss
 `).split('\n').map(s => s.trim()).filter(Boolean);
@@ -34,6 +35,10 @@ const positiveKeywords = [
   'thai dtv',
   'dtv thailand',
   'dtv from',
+  'dtv application',
+  'dtv requirements',
+  'dtv approved',
+  'dtv rejected',
   'thailand visa',
   'thai visa',
   'remote work thailand',
@@ -62,7 +67,7 @@ const leads = new Map();
 let firstRun = true;
 let telegramOffset = 0;
 let checkingFeeds = false;
-let rateLimitedUntil = 0;
+const feedCooldownUntil = new Map();
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -121,9 +126,10 @@ async function fetchFeed(feedUrl) {
   });
 
   if (res.status === 429) {
-    const retryAfter = Number(res.headers.get('retry-after') || 1800);
-    rateLimitedUntil = Date.now() + Math.max(retryAfter, 1800) * 1000;
-    throw new Error(`Reddit rate limit 429. Pausing Reddit checks for ${Math.round((rateLimitedUntil - Date.now()) / 60000)} min.`);
+    const retryAfter = Number(res.headers.get('retry-after') || 3600);
+    const cooldownMs = Math.max(retryAfter, 3600) * 1000;
+    feedCooldownUntil.set(feedUrl, Date.now() + cooldownMs);
+    throw new Error(`Reddit rate limit 429. Skipping this feed for ${Math.round(cooldownMs / 60000)} min.`);
   }
 
   if (!res.ok) {
@@ -196,18 +202,17 @@ async function notifyLead(item, feedUrl) {
 
 async function checkFeeds() {
   if (checkingFeeds) return;
-  if (Date.now() < rateLimitedUntil) {
-    console.log(`Skipping Reddit check because of rate limit. Next retry at ${new Date(rateLimitedUntil).toISOString()}`);
-    return;
-  }
-
   checkingFeeds = true;
 
   try {
     console.log(`[${new Date().toISOString()}] Checking ${feeds.length} subreddit feeds...`);
 
     for (const feedUrl of feeds) {
-      if (Date.now() < rateLimitedUntil) break;
+      const cooldownUntil = feedCooldownUntil.get(feedUrl) || 0;
+      if (Date.now() < cooldownUntil) {
+        console.log(`Skipping ${feedUrl} because it is rate-limited until ${new Date(cooldownUntil).toISOString()}`);
+        continue;
+      }
 
       try {
         const feed = await fetchFeed(feedUrl);
@@ -224,6 +229,7 @@ async function checkFeeds() {
           if (firstRun && IGNORE_EXISTING_ON_START) continue;
           if (!isRelevant(item)) continue;
 
+          console.log(`Lead match: ${item.title || 'No title'} ${item.link || ''}`);
           await notifyLead(item, feedUrl);
           await sleep(3000);
         }
@@ -231,10 +237,11 @@ async function checkFeeds() {
         console.error(`Feed error ${feedUrl}:`, err.message);
       }
 
-      await sleep(20000);
+      await sleep(45000);
     }
 
     firstRun = false;
+    console.log(`[${new Date().toISOString()}] Feed check finished. Next check in ${CHECK_INTERVAL_MINUTES} minutes.`);
   } finally {
     checkingFeeds = false;
   }
