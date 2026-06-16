@@ -1,28 +1,30 @@
 const Parser = require('rss-parser');
 const crypto = require('crypto');
 
-const parser = new Parser({ timeout: 20000 });
+const parser = new Parser({ timeout: 30000 });
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const CHECK_INTERVAL_MINUTES = Number(process.env.CHECK_INTERVAL_MINUTES || 15);
+const CHECK_INTERVAL_MINUTES = Number(process.env.CHECK_INTERVAL_MINUTES || 30);
 const IGNORE_EXISTING_ON_START = (process.env.IGNORE_EXISTING_ON_START || 'true').toLowerCase() === 'true';
-const REDDIT_USER_AGENT = process.env.REDDIT_USER_AGENT || 'reddit-dtv-monitor/1.0 by henryliiber';
+const REDDIT_USER_AGENT = process.env.REDDIT_USER_AGENT || 'Mozilla/5.0 reddit-dtv-monitor/1.0 by henryliiber';
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variable.');
   process.exit(1);
 }
 
+// Search RSS endpoints get rate-limited easily from cloud IPs. New-post subreddit RSS feeds are more stable.
+// We read newest posts from relevant subreddits and filter locally by DTV/visa keywords.
 const feeds = (process.env.REDDIT_FEEDS || `
-https://www.reddit.com/search.rss?q=%22DTV%20visa%22%20Thailand&sort=new
-https://www.reddit.com/search.rss?q=%22Thailand%20DTV%22&sort=new
-https://www.reddit.com/search.rss?q=%22Destination%20Thailand%20Visa%22&sort=new
-https://www.reddit.com/r/ThailandTourism/search.rss?q=%22DTV%20visa%22&restrict_sr=1&sort=new
-https://www.reddit.com/r/digitalnomad/search.rss?q=Thailand%20visa&restrict_sr=1&sort=new
-https://www.reddit.com/r/Thailand/search.rss?q=%22DTV%20visa%22&restrict_sr=1&sort=new
+https://www.reddit.com/r/ThailandTourism/new.rss
+https://www.reddit.com/r/digitalnomad/new.rss
+https://www.reddit.com/r/Thailand/new.rss
+https://www.reddit.com/r/ThailandExpats/new.rss
+https://www.reddit.com/r/expats/new.rss
+https://www.reddit.com/r/visas/new.rss
 `).split('\n').map(s => s.trim()).filter(Boolean);
 
 const positiveKeywords = [
@@ -30,16 +32,29 @@ const positiveKeywords = [
   'destination thailand visa',
   'thailand dtv',
   'thai dtv',
+  'dtv thailand',
+  'dtv from',
   'thailand visa',
   'thai visa',
   'remote work thailand',
   'digital nomad thailand',
   'apply from vietnam',
+  'apply in vietnam',
   'hanoi embassy',
   'laos embassy',
   'thai embassy',
   'soft power visa',
-  'muay thai visa'
+  'muay thai visa',
+  '500k baht',
+  '500,000 baht'
+];
+
+const negativeKeywords = [
+  'us visa',
+  'schengen visa',
+  'student visa usa',
+  'canada visa',
+  'uk visa'
 ];
 
 const seen = new Set();
@@ -47,6 +62,7 @@ const leads = new Map();
 let firstRun = true;
 let telegramOffset = 0;
 let checkingFeeds = false;
+let rateLimitedUntil = 0;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -70,6 +86,7 @@ function stripHtml(html = '') {
 
 function isRelevant(item) {
   const text = `${item.title || ''} ${stripHtml(item.content || item.contentSnippet || '')}`.toLowerCase();
+  if (negativeKeywords.some(k => text.includes(k))) return false;
   return positiveKeywords.some(k => text.includes(k));
 }
 
@@ -98,12 +115,15 @@ async function fetchFeed(feedUrl) {
   const res = await fetch(feedUrl, {
     headers: {
       'user-agent': REDDIT_USER_AGENT,
-      'accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
+      'accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
+      'cache-control': 'no-cache'
     }
   });
 
   if (res.status === 429) {
-    throw new Error('Reddit rate limit 429. Waiting for next cycle.');
+    const retryAfter = Number(res.headers.get('retry-after') || 1800);
+    rateLimitedUntil = Date.now() + Math.max(retryAfter, 1800) * 1000;
+    throw new Error(`Reddit rate limit 429. Pausing Reddit checks for ${Math.round((rateLimitedUntil - Date.now()) / 60000)} min.`);
   }
 
   if (!res.ok) {
@@ -176,15 +196,23 @@ async function notifyLead(item, feedUrl) {
 
 async function checkFeeds() {
   if (checkingFeeds) return;
+  if (Date.now() < rateLimitedUntil) {
+    console.log(`Skipping Reddit check because of rate limit. Next retry at ${new Date(rateLimitedUntil).toISOString()}`);
+    return;
+  }
+
   checkingFeeds = true;
 
   try {
-    console.log(`[${new Date().toISOString()}] Checking ${feeds.length} feeds...`);
+    console.log(`[${new Date().toISOString()}] Checking ${feeds.length} subreddit feeds...`);
 
     for (const feedUrl of feeds) {
+      if (Date.now() < rateLimitedUntil) break;
+
       try {
         const feed = await fetchFeed(feedUrl);
-        const items = (feed.items || []).slice(0, 10).reverse();
+        const items = (feed.items || []).slice(0, 25).reverse();
+        console.log(`Feed OK: ${feedUrl} (${items.length} items)`);
 
         for (const item of items) {
           const unique = item.guid || item.link || item.title;
@@ -197,13 +225,13 @@ async function checkFeeds() {
           if (!isRelevant(item)) continue;
 
           await notifyLead(item, feedUrl);
-          await sleep(2500);
+          await sleep(3000);
         }
       } catch (err) {
         console.error(`Feed error ${feedUrl}:`, err.message);
       }
 
-      await sleep(7000);
+      await sleep(20000);
     }
 
     firstRun = false;
