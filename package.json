@@ -1,0 +1,1 @@
+{"scripts":{"start":"node index.js"},"dependencies":{"rss-parser":"^3.13.0"},"engines":{"node":">=18"}}
